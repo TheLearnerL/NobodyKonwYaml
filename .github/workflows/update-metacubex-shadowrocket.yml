@@ -1,0 +1,141 @@
+name: 更新 MetaCubeX Shadowrocket 广泛规则
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/update-metacubex-shadowrocket.yml"
+      - "tools/build_shadowrocket_cn_rules.rb"
+      - "tools/validate_shadowrocket_ruleset.rb"
+  schedule:
+    # 每周一台湾时间 12:23；避开整点的 GitHub Actions 高负载时段。
+    - cron: "23 12 * * 1"
+      timezone: "Asia/Taipei"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-metacubex-shadowrocket-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  update:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出默认分支
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: 获取固定上游提交并生成候选规则
+        id: generate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          output_path="generated/metacubex-geosite-cn-shadowrocket.list"
+          upstream_commit="$(git ls-remote https://github.com/MetaCubeX/meta-rules-dat.git refs/heads/meta | awk 'NR == 1 { print $1 }')"
+          if [[ ! "${upstream_commit}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "无法解析 MetaCubeX meta 分支提交。" >&2
+            exit 1
+          fi
+
+          source_url="https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/${upstream_commit}/geo/geosite/cn.list"
+          source_file="$(mktemp)"
+          candidate_file="$(mktemp)"
+          current_rules="$(mktemp)"
+          candidate_rules="$(mktemp)"
+          trap 'rm -f "${source_file}" "${candidate_file}" "${current_rules}" "${candidate_rules}"' EXIT
+
+          curl --proto '=https' --tlsv1.2 \
+            --fail --show-error --silent --location \
+            --retry 3 --retry-all-errors \
+            "${source_url}" \
+            --output "${source_file}"
+
+          source_sha256="$(sha256sum "${source_file}" | awk '{ print $1 }')"
+          current_sha256=""
+          if [[ -f "${output_path}" ]]; then
+            current_sha256="$(sed -n 's/^# Source SHA-256: //p' "${output_path}" | head -n 1)"
+          fi
+          if [[ "${source_sha256}" == "${current_sha256}" ]]; then
+            echo "MetaCubeX 内容未变化：${source_sha256}"
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          ruby tools/build_shadowrocket_cn_rules.rb \
+            --profile broad \
+            --source "${source_file}" \
+            --source-label "${source_url}" \
+            --expected-sha256 "${source_sha256}" \
+            --rules-output "${candidate_file}"
+
+          if [[ -f "${output_path}" ]]; then
+            awk '/^DOMAIN-SUFFIX,/ { print }' "${output_path}" | LC_ALL=C sort -u > "${current_rules}"
+          else
+            : > "${current_rules}"
+          fi
+          awk '/^DOMAIN-SUFFIX,/ { print }' "${candidate_file}" | LC_ALL=C sort -u > "${candidate_rules}"
+          current_count="$(wc -l < "${current_rules}" | tr -d ' ')"
+          candidate_count="$(wc -l < "${candidate_rules}" | tr -d ' ')"
+          if (( candidate_count < 100000 || candidate_count > 200000 )); then
+            echo "候选规则数量超出安全范围：${candidate_count}" >&2
+            exit 1
+          fi
+
+          if (( current_count > 0 )); then
+            delta=$(( candidate_count - current_count ))
+            (( delta < 0 )) && delta=$(( -delta ))
+            maximum_delta=$(( current_count / 10 + 1000 ))
+            if (( delta > maximum_delta )); then
+              echo "候选规则数量变化过大：${current_count} -> ${candidate_count}" >&2
+              exit 1
+            fi
+
+            added_count="$(comm -13 "${current_rules}" "${candidate_rules}" | wc -l | tr -d ' ')"
+            removed_count="$(comm -23 "${current_rules}" "${candidate_rules}" | wc -l | tr -d ' ')"
+            changed_rules=$(( added_count + removed_count ))
+            maximum_changed_rules=$(( current_count / 20 + 100 ))
+            if (( changed_rules > maximum_changed_rules )); then
+              echo "候选规则集合变化过大：新增 ${added_count}，删除 ${removed_count}，允许上限 ${maximum_changed_rules}" >&2
+              exit 1
+            fi
+          fi
+
+          mv "${candidate_file}" "${output_path}"
+          echo "changed=true" >> "${GITHUB_OUTPUT}"
+          echo "upstream_commit=${upstream_commit}" >> "${GITHUB_OUTPUT}"
+          echo "source_sha256=${source_sha256}" >> "${GITHUB_OUTPUT}"
+
+      - name: 验证公开规则产物
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruby -c tools/build_shadowrocket_cn_rules.rb
+          ruby -c tools/validate_shadowrocket_ruleset.rb
+          ruby tools/validate_shadowrocket_ruleset.rb \
+            broad \
+            generated/metacubex-geosite-cn-shadowrocket.list
+          git diff --check
+
+      - name: 提交更新后的规则
+        if: steps.generate.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -- generated/metacubex-geosite-cn-shadowrocket.list
+          if git diff --cached --quiet; then
+            echo "生成文件没有可提交的变化。"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          generated_at="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          git commit -m "chore: ${generated_at} 自动更新 MetaCubeX Shadowrocket 规则"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
